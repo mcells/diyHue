@@ -1,3 +1,4 @@
+from time import sleep
 import logManager
 import configManager
 import socket, json
@@ -34,11 +35,13 @@ def findGradientStrip(group):
             return light()
     return "not found"
 
-def find_entertainment_group(light, groupname):
+def get_hue_entertainment_group(light, groupname):
     group = requests.get("http://" + light.protocol_cfg["ip"] + "/api/" + light.protocol_cfg["hueUser"] + "/groups/", timeout=3)
+    #logging.debug("Returned Groups: " + group.text)
     groups = json.loads(group.text)
     out = -1
     for i, grp in groups.items():
+        #logging.debug("Group "  + i + " has Name " + grp["name"] + " and type " + grp["type"])
         if (grp["name"] == groupname) and (grp["type"] == "Entertainment") and (light.protocol_cfg["id"] in grp["lights"]):
             out = i
             logging.debug("Found Corresponding entertainment group with id " + out + " for light " + light.name)
@@ -57,17 +60,21 @@ def entertainmentService(group, user):
     for light in group.lights:
         lights_v1[int(light().id_v1)] = light()
         lights_v2.append(light())
-        if light().protocol == "hue" and find_entertainment_group(light(), group.name) != -1: # If the lights' Hue bridge has an entertainment group with the same name as the current group, we use it to sync the lights.
-            hueGroup = find_entertainment_group(light(), group.name)
-            hueGroupLights[int(light().protocol_cfg["id"])] = []
+        if light().protocol == "hue" and get_hue_entertainment_group(light(), group.name) != -1: # If the lights' Hue bridge has an entertainment group with the same name as this current group, we use it to sync the lights.
+            hueGroup = get_hue_entertainment_group(light(), group.name)
+            hueGroupLights[int(light().protocol_cfg["id"])] = [] # Add light id to list
         channel += 1
+        
     logging.debug(lights_v1)
     logging.debug(lights_v2)
     opensslCmd = ['openssl', 's_server', '-dtls', '-psk', user.client_key, '-psk_identity', user.username, '-nocert', '-accept', '2100', '-quiet']
     p = Popen(opensslCmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
-    if hueGroup != -1:  # If we have found a hue Bridge containing a suitable entertainment group for at least one lamp, we connect to it
+    if hueGroup != -1:  # If we have found a hue Brige containing a suitable entertainment group for at least one Lamp, we connect to it
         h = HueConnection(bridgeConfig["config"]["hue"]["ip"])
-        h.connect(hueGroup)
+        h.connect(hueGroup, hueGroupLights)
+        if h._connected == False:
+            hueGroupLights = {} # on a failed connection, empty the list
+
     init = False
     frameBites = 10
     fremeID = 1
@@ -380,27 +387,37 @@ class HueConnection(object):
     _ip = ""
     _entGroup = -1
     _connection = ""
+    _hueLights = []
 
     def __init__(self, ip):
         self._ip = ip
     
-    def connect(self, hueGroup):
+    def connect(self, hueGroup, *lights):
         self._entGroup = hueGroup
+        self._hueLights = lights
         self.disconnect()
 
         url = "HTTP://" + str(self._ip) + "/api/" + bridgeConfig["config"]["hue"]["hueUser"] + "/groups/" + str(self._entGroup)
         r = requests.put(url, json={"stream":{"active":True}})
         logging.debug("Outgoing connection to hue Bridge returned: " + r.text)
-
-        _opensslCmd = ['openssl', 's_client', '-quiet', '-cipher', 'PSK-AES128-GCM-SHA256', '-dtls', '-psk', bridgeConfig["config"]["hue"]["hueKey"], '-psk_identity', bridgeConfig["config"]["hue"]["hueUser"], '-connect', self._ip + ':2100']
-        self._connection = Popen(_opensslCmd, stdin=PIPE, stdout=None, stderr=None)
-        self._connected = True 
+        try:
+            _opensslCmd = ['openssl', 's_client', '-quiet', '-cipher', 'PSK-AES128-GCM-SHA256', '-dtls', '-psk', bridgeConfig["config"]["hue"]["hueKey"], '-psk_identity', bridgeConfig["config"]["hue"]["hueUser"], '-connect', self._ip + ':2100']
+            self._connection = Popen(_opensslCmd, stdin=PIPE, stdout=None, stderr=None) # Open a dtls connection to the Hue bridge
+            self._connected = True
+            sleep(1) # Wait a bit to catch errors
+            err = self._connection.poll()
+            if err != None:
+                raise ConnectionError(err)
+        except Exception as e:
+            logging.info("Error connecting to Hue bridge for entertainment. Is a proper hueKey set? openssl connection returned: %s", e)
+            self.disconnect()
 
     def disconnect(self):
         url = "HTTP://" + str(self._ip) + "/api/" + bridgeConfig["config"]["hue"]["hueUser"] + "/groups/" + str(self._entGroup)
         if self._connected:
             self._connection.kill()
         requests.put(url, data={"stream":{"active":False}})
+        self._connected = False
 
     def send(self, lights):
         arr = bytearray("HueStream", 'ascii')
